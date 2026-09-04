@@ -4,7 +4,7 @@
 
 set -Eeuo pipefail
 
-VERSION="3.0.0"
+VERSION="3.1.0"
 
 STATE_DIR="/etc/po0-relay"
 STATE_FILE="${STATE_DIR}/rules.db"
@@ -643,6 +643,189 @@ add_rule() {
 
   ok "已加入待应用列表：${name} ${protocol} ${in_if}:${relay_port} -> ${dest_ip}:${dest_port}"
   info "出口=${ROUTE_IF}，逐规则 SNAT=${ROUTE_SRC}，来源=${sources}，MSS=${mss}"
+}
+
+edit_rule() {
+  local selection idx input candidate confirm
+  local old_name old_protocol old_in_if old_relay_port old_dest_ip old_dest_port old_sources old_mss
+  local new_name new_protocol new_in_if new_relay_port new_dest_ip new_dest_port new_sources new_mss
+  local new_out_if new_snat_ip new_route_line
+
+  ((${#RULE_NAMES[@]} > 0)) || { warn "没有可编辑的转发规则"; return; }
+  show_rules
+  read -rp "编辑转发序号（0 取消）：" selection
+  [[ $selection =~ ^[0-9]+$ ]] || { warn "请输入数字"; return; }
+  ((selection != 0)) || return
+  ((selection >= 1 && selection <= ${#RULE_NAMES[@]})) || { warn "序号超出范围"; return; }
+  idx=$((selection-1))
+
+  old_name=${RULE_NAMES[idx]}
+  old_protocol=${RULE_PROTOCOLS[idx]}
+  old_in_if=${IN_IFS[idx]}
+  old_relay_port=${RELAY_PORTS[idx]}
+  old_dest_ip=${DEST_IPS[idx]}
+  old_dest_port=${DEST_PORTS[idx]}
+  old_sources=${SOURCE_CIDRS[idx]}
+  old_mss=${MSS_VALUES[idx]}
+
+  new_name=$old_name
+  new_protocol=$old_protocol
+  new_in_if=$old_in_if
+  new_relay_port=$old_relay_port
+  new_dest_ip=$old_dest_ip
+  new_dest_port=$old_dest_port
+  new_sources=$old_sources
+  new_mss=$old_mss
+
+  echo
+  info "正在编辑 [${old_name}]；每一项直接回车表示保持原值"
+
+  while true; do
+    read -rp "线路名称 [${new_name}]：" input
+    [[ -n "$input" ]] || break
+    candidate=$(sanitize_name "$input")
+    [[ -n "$candidate" ]] || { warn "线路名称不能为空"; continue; }
+    new_name=$candidate
+    break
+  done
+
+  while true; do
+    read -rp "协议 [${new_protocol}]：1=TCP+UDP，2=TCP，3=UDP（回车保持）：" input
+    case "${input:-}" in
+      "") break ;;
+      1) new_protocol=both; break ;;
+      2) new_protocol=tcp; break ;;
+      3) new_protocol=udp; break ;;
+      *) warn "请输入 1、2、3，或直接回车保持原值" ;;
+    esac
+  done
+
+  while true; do
+    read -rp "入口网卡 [${new_in_if}]：" input
+    candidate=${input:-$new_in_if}
+    is_valid_ifname "$candidate" || { warn "网卡不存在或名称无效；可用 ip -brief link 查看"; continue; }
+    new_in_if=$candidate
+    break
+  done
+
+  while true; do
+    read -rp "中转入口端口 [${new_relay_port}]：" input
+    candidate=${input:-$new_relay_port}
+    is_valid_port "$candidate" || { warn "端口必须在 1-65535 之间"; continue; }
+    if [[ "$candidate" != "$old_relay_port" || "$new_protocol" != "$old_protocol" ]]; then
+      ssh_port_conflicts "$candidate" "$new_protocol" && {
+        warn "不能占用 SSH TCP 端口 ${candidate}"
+        continue
+      }
+      local_port_conflicts "$candidate" "$new_protocol" && {
+        warn "${new_protocol}/${candidate} 已登记为本机服务端口，不能同时用于转发"
+        continue
+      }
+      if local_port_is_listening "$new_protocol" "$candidate"; then
+        warn "本机已有进程监听 ${new_protocol}/${candidate}，请换一个中转端口"
+        continue
+      fi
+    fi
+    if [[ "$new_in_if" != "$old_in_if" || "$candidate" != "$old_relay_port" || \
+          "$new_protocol" != "$old_protocol" ]] && \
+       relay_rule_conflicts "$new_in_if" "$candidate" "$new_protocol" "$idx"; then
+      warn "${new_in_if} 上的 ${new_protocol}/${candidate} 已被重叠协议的其他转发规则使用"
+      continue
+    fi
+    new_relay_port=$candidate
+    break
+  done
+
+  while true; do
+    read -rp "下一跳/落地机 IPv4 [${new_dest_ip}]：" input
+    candidate=${input:-$new_dest_ip}
+    is_valid_ipv4 "$candidate" || { warn "IPv4 格式无效"; continue; }
+    if ! detect_destination_route "$candidate"; then
+      warn "当前没有可用路由，或无法确定出口源地址"
+      continue
+    fi
+    new_dest_ip=$candidate
+    new_out_if=$ROUTE_IF
+    new_snat_ip=$ROUTE_SRC
+    new_route_line=$ROUTE_LINE
+    printf '  内核路由：%s\n' "$new_route_line"
+    printf '  将使用：出口=%s，SNAT源地址=%s\n' "$new_out_if" "$new_snat_ip"
+    break
+  done
+
+  while true; do
+    read -rp "下一跳/落地机端口 [${new_dest_port}]：" input
+    candidate=${input:-$new_dest_port}
+    is_valid_port "$candidate" || { warn "端口必须在 1-65535 之间"; continue; }
+    new_dest_port=$candidate
+    break
+  done
+
+  while true; do
+    read -rp "允许的来源 IPv4/CIDR [${new_sources}]；多个用逗号分隔，* 表示任意：" input
+    if [[ -z "$input" ]]; then
+      break
+    fi
+    candidate=$(normalize_source_cidrs "$input" 2>/dev/null || true)
+    [[ -n "$candidate" ]] || {
+      warn "来源格式无效，例如：1.2.3.4,10.0.0.0/8 或 *"
+      continue
+    }
+    new_sources=$candidate
+    break
+  done
+
+  if [[ "$new_protocol" == udp ]]; then
+    [[ "$new_mss" == off ]] || warn "UDP 不使用 TCP MSS，已将 MSS 改为 off"
+    new_mss=off
+  else
+    while true; do
+      read -rp "TCP MSS [${new_mss}]：off=关闭，auto=按路由MTU钳制，或输入固定值：" input
+      candidate=${input:-$new_mss}
+      is_valid_mss "$candidate" || {
+        warn "请输入 off、auto 或 536-65535 的整数"
+        continue
+      }
+      new_mss=$candidate
+      break
+    done
+  fi
+
+  echo
+  printf '编辑结果：\n'
+  printf '  名称：%s\n' "$new_name"
+  printf '  协议：%s\n' "$new_protocol"
+  printf '  入口：%s:%s\n' "$new_in_if" "$new_relay_port"
+  printf '  下一跳：%s:%s\n' "$new_dest_ip" "$new_dest_port"
+  printf '  出口/SNAT：%s/%s\n' "$new_out_if" "$new_snat_ip"
+  printf '  来源：%s\n' "$new_sources"
+  printf '  MSS：%s\n' "$new_mss"
+
+  if [[ "$new_name" == "$old_name" && "$new_protocol" == "$old_protocol" && \
+        "$new_in_if" == "$old_in_if" && "$new_relay_port" == "$old_relay_port" && \
+        "$new_dest_ip" == "$old_dest_ip" && "$new_dest_port" == "$old_dest_port" && \
+        "$new_sources" == "$old_sources" && "$new_mss" == "$old_mss" ]]; then
+    info "没有字段发生变化"
+    return
+  fi
+
+  read -rp "输入 SAVE 确认保存到待应用列表：" confirm
+  [[ ${confirm:-} == SAVE ]] || { info "已取消编辑，原规则保持不变"; return; }
+
+  RULE_NAMES[idx]=$new_name
+  RULE_PROTOCOLS[idx]=$new_protocol
+  IN_IFS[idx]=$new_in_if
+  RELAY_PORTS[idx]=$new_relay_port
+  DEST_IPS[idx]=$new_dest_ip
+  DEST_PORTS[idx]=$new_dest_port
+  SOURCE_CIDRS[idx]=$new_sources
+  MSS_VALUES[idx]=$new_mss
+  OUT_IFS[idx]=$new_out_if
+  SNAT_IPS[idx]=$new_snat_ip
+  ROUTE_LINES[idx]=$new_route_line
+
+  ok "规则 [${old_name}] 已更新到待应用列表"
+  info "请选择“应用并保存”后才会真正生效"
 }
 
 delete_rule() {
@@ -1428,29 +1611,31 @@ interactive_menu() {
     echo "=========================================================================="
     echo "  1) 查看规则、逐线路路由和本机端口"
     echo "  2) 添加转发规则"
-    echo "  3) 删除转发规则"
-    echo "  4) 清空转发规则"
-    echo "  5) 应用并保存"
-    echo "  6) 查看运行状态和计数器"
-    echo "  7) 从备份回滚"
-    echo "  8) 添加本机服务端口"
-    echo "  9) 删除本机服务端口"
-    echo " 10) 查看本机当前监听端口"
-    echo " 11) 切换安全接管/NAT共存模式"
+    echo "  3) 编辑转发规则"
+    echo "  4) 删除转发规则"
+    echo "  5) 清空转发规则"
+    echo "  6) 应用并保存"
+    echo "  7) 查看运行状态和计数器"
+    echo "  8) 从备份回滚"
+    echo "  9) 添加本机服务端口"
+    echo " 10) 删除本机服务端口"
+    echo " 11) 查看本机当前监听端口"
+    echo " 12) 切换安全接管/NAT共存模式"
     echo "  0) 不应用并退出"
     read -rp "请选择：" choice
     case "${choice:-}" in
       1) show_rules ;;
       2) add_rule ;;
-      3) delete_rule ;;
-      4) clear_rules ;;
-      5) apply_configuration; load_state ;;
-      6) status_report ;;
-      7) rollback_menu; load_state ;;
-      8) add_local_port ;;
-      9) delete_local_port ;;
-      10) show_listening_ports ;;
-      11) choose_mode ;;
+      3) edit_rule ;;
+      4) delete_rule ;;
+      5) clear_rules ;;
+      6) apply_configuration; load_state ;;
+      7) status_report ;;
+      8) rollback_menu; load_state ;;
+      9) add_local_port ;;
+      10) delete_local_port ;;
+      11) show_listening_ports ;;
+      12) choose_mode ;;
       0) exit 0 ;;
       *) warn "无效选择" ;;
     esac
