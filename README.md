@@ -4,6 +4,8 @@
 
 当前版本：`3.1.0`
 
+默认维护分支：`main`
+
 ## 主要功能
 
 - TCP、UDP 或 TCP+UDP 的 IPv4 DNAT/SNAT 中转。
